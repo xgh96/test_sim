@@ -1,13 +1,20 @@
 # run.py
-# PyBullet(DIRECT) + MeshCat
-# UR3e + Robotiq 2F-85: pick phone from cabinet mid-shelf -> place on workstation
+# CPU-only PyBullet(DIRECT) + MeshCat visualization
+# UR3e + Robotiq 2F-85: pick phone from cabinet mid-shelf -> place to workstation
 #
-# Key fix for "joint disconnect" (visual gap/segment drifting in MeshCat):
-# - Use unit primitives (unit cylinder / unit sphere / unit box fallback)
-# - Apply full scale via transform matrix each frame: S=diag([r, L, r])
-# - Strong overlap so cylinders always penetrate joint spheres => never visible gaps
+# Key guarantees in this script:
+# 1) Base placement: base_xy is chosen ON the cabinet-center(C) <-> workstation(W) line extension,
+#    and base yaw always faces cabinet center => cabinet & workstation aligned in base-forward direction.
+# 2) Reachability validation: candidate base positions are scored by IK error on critical waypoints.
+# 3) Obstacle avoidance: joint trajectory is collision-checked against table/cabinet/workstation.
+#    Planner retries with structured detours (x offsets, y-edge offsets, z-clear increments).
+# 4) No random twisting: IK is seeded continuously + per-step delta cap + joint-space densify.
+# 5) Stable idle: arm holds its last target (no drift before commands).
+# 6) Robust grasp: close gripper -> attach constraint only if near phone and gripper sufficiently closed.
 #
-# CPU-only, no GUI, view in MeshCat browser.
+# NOTE:
+# - We use airo_models URDFs; PyBullet physics + constraint-based grasp for reliability.
+# - Visual arm is a smooth “industrial” look with fixed radii cylinders + joint spheres only at joints.
 
 import math
 import time
@@ -25,40 +32,42 @@ import airo_models
 
 
 # =========================
-# Config
+# Configuration
 # =========================
 @dataclass(frozen=True)
 class SceneConfig:
-    # bigger table (for reach + avoidance)
-    table_w: float = 3.00
-    table_d: float = 1.80
+    # Larger table to ensure reach & obstacle clearance
+    table_w: float = 2.30
+    table_d: float = 1.40
     table_h: float = 0.75
     table_top_t: float = 0.045
     table_leg_w: float = 0.075
-    table_leg_inset: float = 0.20
-    table_center_xy: Tuple[float, float] = (1.12, 0.00)
+    table_leg_inset: float = 0.14
+    table_center_xy: Tuple[float, float] = (1.08, 0.00)
 
+    # Robot pedestal (fixed)
     pedestal_size: Tuple[float, float, float] = (0.26, 0.26, 0.14)
 
-    # cabinet (two levels)
-    cab_outer: Tuple[float, float, float] = (0.92, 0.68, 0.72)  # W, D, H
+    # Cabinet (two layers; mid shelf)
+    cab_outer: Tuple[float, float, float] = (0.76, 0.54, 0.62)  # W, D, H
     cab_wall: float = 0.02
     cab_shelf_t: float = 0.02
-    cab_offset_xy: Tuple[float, float] = (0.50, 0.40)
+    cab_offset_xy: Tuple[float, float] = (0.42, 0.32)
 
-    # workstation
-    ws_plate: Tuple[float, float, float] = (0.36, 0.30, 0.015)
+    # Workstation (target location)
+    ws_plate: Tuple[float, float, float] = (0.32, 0.26, 0.015)
     ws_leg_h: float = 0.03
-    ws_offset_xy: Tuple[float, float] = (0.92, -0.46)
+    ws_offset_xy: Tuple[float, float] = (0.78, -0.36)
 
-    # phone
+    # Phone
     phone_size: Tuple[float, float, float] = (0.075, 0.150, 0.008)
 
-    table_margin: float = 0.20
+    # placement constraints
+    table_margin: float = 0.16
 
-    snap_place: bool = True
-    snap_xy_tol: float = 0.05
-    snap_z_tol: float = 0.08
+    # optional: snap on place if close (debug)
+    snap_place: bool = False
+    snap_xy_tol: float = 0.03
 
 
 @dataclass(frozen=True)
@@ -66,33 +75,31 @@ class PlannerConfig:
     dt: float = 1.0 / 240.0
     realtime: bool = True
 
-    cart_step: float = 0.010
-    ang_step_deg: float = 6.5
+    # Cartesian interpolation density
+    cart_step: float = 0.012
+    ang_step_deg: float = 8.0
 
-    max_step_delta_rad: float = 0.14
+    # IK continuity + smoothing
+    max_step_delta_rad: float = 0.16
     joint_damping: float = 0.06
-    densify_max_dq: float = 0.05
 
-    obstacle_margin: float = 0.022
-    exec_collision_margin: float = 0.008
+    # Joint-space densify to avoid jumps
+    densify_max_dq: float = 0.06  # rad
 
-    max_replan_tries: int = 28
+    # Collision checking
+    obstacle_margin: float = 0.020
+    exec_collision_margin: float = 0.007
 
+    # replan
+    max_replan_tries: int = 22
+
+    # execution
     knot_ticks: int = 7
-    settle_tol_rad: float = 0.020
+    settle_tol_rad: float = 0.018
     settle_timeout_s: float = 2.0
 
-    kp: float = 0.85
-    kd: float = 1.25
-    max_force: float = 2600.0
-
-    auto_boost_steps: int = 140
-    auto_boost_force: float = 5200.0
-    auto_boost_kp: float = 1.20
-
-    # shortest-path cost weights
-    cost_w_ee: float = 1.0
-    cost_w_joint: float = 0.20
+    # “near joint limit” warnings
+    limit_warn_rad: float = math.radians(7.0)
 
 
 @dataclass
@@ -103,89 +110,6 @@ class Waypoint:
 
 
 # =========================
-# Math helpers
-# =========================
-def clamp(x: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, x))
-
-
-def orthonormalize(R: np.ndarray) -> np.ndarray:
-    U, _, Vt = np.linalg.svd(R)
-    R2 = U @ Vt
-    if np.linalg.det(R2) < 0:
-        U[:, -1] *= -1
-        R2 = U @ Vt
-    return R2
-
-
-def pose_to_T(pos, quat_xyzw) -> np.ndarray:
-    R = np.array(p.getMatrixFromQuaternion(quat_xyzw), dtype=float).reshape(3, 3)
-    T = np.eye(4)
-    T[:3, :3] = R
-    T[:3, 3] = np.asarray(pos, dtype=float)
-    return T
-
-
-def quat_normalize(q):
-    q = np.asarray(q, dtype=float)
-    n = float(np.linalg.norm(q))
-    if n < 1e-12:
-        return np.array([0, 0, 0, 1], dtype=float)
-    return q / n
-
-
-def quat_slerp(q0, q1, t: float):
-    q0 = quat_normalize(q0)
-    q1 = quat_normalize(q1)
-    dot = float(np.dot(q0, q1))
-    if dot < 0.0:
-        q1 = -q1
-        dot = -dot
-    dot = clamp(dot, -1.0, 1.0)
-    if dot > 0.9995:
-        return quat_normalize(q0 + t * (q1 - q0))
-    theta_0 = math.acos(dot)
-    theta = theta_0 * t
-    sin_theta = math.sin(theta)
-    sin_theta_0 = math.sin(theta_0)
-    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
-    s1 = sin_theta / sin_theta_0
-    return s0 * q0 + s1 * q1
-
-
-def quat_angle_deg(q0, q1) -> float:
-    q0 = quat_normalize(q0)
-    q1 = quat_normalize(q1)
-    dot = abs(float(np.dot(q0, q1)))
-    dot = clamp(dot, -1.0, 1.0)
-    return math.degrees(2.0 * math.acos(dot))
-
-
-def align_y_to_dir(d: np.ndarray) -> np.ndarray:
-    d = np.asarray(d, dtype=float)
-    n = float(np.linalg.norm(d))
-    if n < 1e-9:
-        return np.eye(3)
-    v = d / n
-    y = np.array([0.0, 1.0, 0.0], dtype=float)
-    c = float(np.clip(np.dot(y, v), -1.0, 1.0))
-    if abs(c - 1.0) < 1e-8:
-        return np.eye(3)
-    if abs(c + 1.0) < 1e-8:
-        return np.array([[1, 0, 0],
-                         [0, -1, 0],
-                         [0, 0, -1]], dtype=float)
-    axis = np.cross(y, v)
-    s = float(np.linalg.norm(axis))
-    axis = axis / s
-    K = np.array([[0, -axis[2], axis[1]],
-                  [axis[2], 0, -axis[0]],
-                  [-axis[1], axis[0], 0]], dtype=float)
-    R = np.eye(3) + K + K @ K * ((1 - c) / (s * s))
-    return orthonormalize(R)
-
-
-# =========================
 # MeshCat Bridge
 # =========================
 class MeshcatBridge:
@@ -193,12 +117,14 @@ class MeshcatBridge:
         self.vis = meshcat.Visualizer().open()
         self.vis.delete()
         self._created = set()
+        self.has_cylinder = hasattr(g, "Cylinder")
 
         self.add_frame("world", length=0.30, radius=0.01)
         self.set_transform("world", np.eye(4))
 
+        # camera
         try:
-            self.vis["/Cameras/default"].set_transform(self._T(t=[1.75, 0.25, 1.35]))
+            self.vis["/Cameras/default"].set_transform(self._T(t=[1.65, 0.25, 1.25]))
             self.vis["/Cameras/default/rotated"].set_transform(self._T(R=self._rot_x(-0.95)))
         except Exception:
             pass
@@ -244,45 +170,20 @@ class MeshcatBridge:
         if path in self._created:
             return
         self._created.add(path)
-        if hasattr(g, "Cylinder"):
-            try:
-                self.vis[path].set_object(g.Cylinder(float(length), float(radius)), self._mat(color, opacity))
-                return
-            except Exception:
-                pass
-        self.vis[path].set_object(g.Box([radius * 2, length, radius * 2]), self._mat(color, opacity))
-
-    def add_unit_cylinder_like(self, path: str, color=0xcccccc, opacity=1.0) -> bool:
-        """
-        Create a unit-length, unit-radius cylinder-like primitive at `path`.
-        Returns: uses_box_fallback (True if Box is used).
-        """
-        if path in self._created:
-            return False
-        self._created.add(path)
-
-        if hasattr(g, "Cylinder"):
-            try:
-                # Unit primitive: avoid Cylinder(height,radius) vs Cylinder(radius,height) ambiguity.
-                # We'll always scale with matrix to the desired dimensions.
-                self.vis[path].set_object(g.Cylinder(1.0, 1.0), self._mat(color, opacity))
-                return False
-            except Exception:
-                pass
-
-        self.vis[path].set_object(g.Box([1.0, 1.0, 1.0]), self._mat(color, opacity))
-        return True
+        if self.has_cylinder:
+            self.vis[path].set_object(g.Cylinder(float(length), float(radius)), self._mat(color, opacity))
+        else:
+            self.vis[path].set_object(g.Box([radius * 2, length, radius * 2]), self._mat(color, opacity))
 
     def add_frame(self, path: str, length: float = 0.12, radius: float = 0.006):
+        # x red, y green, z blue
         self.add_cylinder_or_box(f"{path}/y", length, radius, color=0x00ff00, opacity=1.0)
         self.set_transform(f"{path}/y", self._T(t=[0, length / 2, 0]))
-
         self.add_cylinder_or_box(f"{path}/x", length, radius, color=0xff0000, opacity=1.0)
         self.set_transform(f"{path}/x", self._T(R=np.array([[0, -1, 0],
                                                             [1, 0, 0],
                                                             [0, 0, 1]], dtype=float),
                                               t=[length / 2, 0, 0]))
-
         self.add_cylinder_or_box(f"{path}/z", length, radius, color=0x0000ff, opacity=1.0)
         self.set_transform(f"{path}/z", self._T(R=self._rot_x(math.pi / 2), t=[0, 0, length / 2]))
 
@@ -299,70 +200,157 @@ class MeshcatBridge:
 
 
 # =========================
-# UR Industrial Visual (ROBUST, NO GAPS)
+# Math utils
+# =========================
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+def orthonormalize(R: np.ndarray) -> np.ndarray:
+    U, _, Vt = np.linalg.svd(R)
+    R2 = U @ Vt
+    if np.linalg.det(R2) < 0:
+        U[:, -1] *= -1
+        R2 = U @ Vt
+    return R2
+
+
+def pose_to_T(pos, quat_xyzw) -> np.ndarray:
+    R = np.array(p.getMatrixFromQuaternion(quat_xyzw), dtype=float).reshape(3, 3)
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = np.asarray(pos, dtype=float)
+    return T
+
+
+def align_y_to_dir(d: np.ndarray) -> np.ndarray:
+    d = np.asarray(d, dtype=float)
+    n = float(np.linalg.norm(d))
+    if n < 1e-9:
+        return np.eye(3)
+    v = d / n
+    y = np.array([0.0, 1.0, 0.0], dtype=float)
+    c = float(np.clip(np.dot(y, v), -1.0, 1.0))
+    if abs(c - 1.0) < 1e-8:
+        return np.eye(3)
+    if abs(c + 1.0) < 1e-8:
+        return np.array([[1, 0, 0],
+                         [0, -1, 0],
+                         [0, 0, -1]], dtype=float)
+
+    axis = np.cross(y, v)
+    s = float(np.linalg.norm(axis))
+    axis = axis / s
+
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]], dtype=float)
+    R = np.eye(3) + K + K @ K * ((1 - c) / (s * s))
+    return orthonormalize(R)
+
+
+def quat_normalize(q):
+    q = np.asarray(q, dtype=float)
+    n = float(np.linalg.norm(q))
+    if n < 1e-12:
+        return np.array([0, 0, 0, 1], dtype=float)
+    return q / n
+
+
+def quat_slerp(q0, q1, t: float):
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = clamp(dot, -1.0, 1.0)
+    if dot > 0.9995:
+        return quat_normalize(q0 + t * (q1 - q0))
+
+    theta_0 = math.acos(dot)
+    theta = theta_0 * t
+    sin_theta = math.sin(theta)
+    sin_theta_0 = math.sin(theta_0)
+
+    s0 = math.cos(theta) - dot * sin_theta / sin_theta_0
+    s1 = sin_theta / sin_theta_0
+    return s0 * q0 + s1 * q1
+
+
+def quat_angle_deg(q0, q1) -> float:
+    q0 = quat_normalize(q0)
+    q1 = quat_normalize(q1)
+    dot = abs(float(np.dot(q0, q1)))
+    dot = clamp(dot, -1.0, 1.0)
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def quat_from_R(R: np.ndarray) -> Tuple[float, float, float, float]:
+    m = R
+    tr = m[0, 0] + m[1, 1] + m[2, 2]
+    if tr > 0.0:
+        S = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * S
+        x = (m[2, 1] - m[1, 2]) / S
+        y = (m[0, 2] - m[2, 0]) / S
+        z = (m[1, 0] - m[0, 1]) / S
+    elif (m[0, 0] > m[1, 1]) and (m[0, 0] > m[2, 2]):
+        S = math.sqrt(1.0 + m[0, 0] - m[1, 1] - m[2, 2]) * 2.0
+        w = (m[2, 1] - m[1, 2]) / S
+        x = 0.25 * S
+        y = (m[0, 1] + m[1, 0]) / S
+        z = (m[0, 2] + m[2, 0]) / S
+    elif m[1, 1] > m[2, 2]:
+        S = math.sqrt(1.0 + m[1, 1] - m[0, 0] - m[2, 2]) * 2.0
+        w = (m[0, 2] - m[2, 0]) / S
+        x = (m[0, 1] + m[1, 0]) / S
+        y = 0.25 * S
+        z = (m[1, 2] + m[2, 1]) / S
+    else:
+        S = math.sqrt(1.0 + m[2, 2] - m[0, 0] - m[1, 1]) * 2.0
+        w = (m[1, 0] - m[0, 1]) / S
+        x = (m[0, 2] + m[2, 0]) / S
+        y = (m[1, 2] + m[2, 1]) / S
+        z = 0.25 * S
+    return (x, y, z, w)
+
+
+# =========================
+# Industrial-looking UR arm visual
 # =========================
 class URArmVisual:
-    """
-    Robust, gap-free visual arm:
-    - segments: unit cylinder (or unit box fallback) scaled by matrix S=diag([r, L, r])
-    - joints: unit sphere scaled by matrix S=diag([R, R, R])
-    - cylinders extend into joint spheres (overlap) so there is never any visible gap.
-    """
     def __init__(self, viz: MeshcatBridge):
         self.viz = viz
-
+        self.seg_len_nom: List[float] = []
         self.seg_rad: List[float] = []
         self.joint_rad: List[float] = []
 
-        # if cylinder creation falls back to box, x/z scale must be 2r (box width=1 => half extent=0.5)
-        self._seg_xz_factor: float = 1.0
-        self._flange_xz_factor: float = 1.0
+    def create(self, seg_dist_nom: List[float], seg_rad: List[float], joint_rad: List[float]):
+        assert len(seg_dist_nom) == 7 and len(seg_rad) == 7 and len(joint_rad) == 6
+        self.seg_len_nom = [max(float(d), 0.02) for d in seg_dist_nom]
+        self.seg_rad = list(seg_rad)
+        self.joint_rad = list(joint_rad)
 
-        # Tune for “never show gaps”
-        self.joint_cover_scale: float = 1.08   # sphere slightly bigger than neighbor segment radius
-        self.overlap_frac: float = 0.85        # cylinder penetrates sphere deeply => never gap
+        for k in range(7):
+            self.viz.add_cylinder_or_box(f"robot/ur/seg{k}",
+                                         length=self.seg_len_nom[k],
+                                         radius=self.seg_rad[k],
+                                         color=0xd7d7d7,
+                                         opacity=1.0)
 
-    def create(self, seg_rad: List[float]):
-        assert len(seg_rad) == 7
-        self.seg_rad = [float(r) for r in seg_rad]
-
-        # joint radius derived from adjacent segments for smooth look
-        self.joint_rad = []
-        for j in range(6):
-            r = max(self.seg_rad[j], self.seg_rad[j + 1])
-            self.joint_rad.append(float(r * self.joint_cover_scale))
-
-        # segments as unit cylinder-like
-        uses_box = self.viz.add_unit_cylinder_like("robot/ur/seg0", color=0xd7d7d7, opacity=1.0)
-        for k in range(1, 7):
-            self.viz.add_unit_cylinder_like(f"robot/ur/seg{k}", color=0xd7d7d7, opacity=1.0)
-        self._seg_xz_factor = 2.0 if uses_box else 1.0
-
-        # joints as unit spheres (Sphere API is stable)
+        # joint spheres only at joints (6 joints)
         for k in range(6):
-            path = f"robot/ur/joint{k}"
-            if path in self.viz._created:
-                continue
-            self.viz._created.add(path)
-            self.viz.vis[path].set_object(g.Sphere(1.0), self.viz._mat(0xbcbcbc, 1.0))
+            self.viz.add_sphere(f"robot/ur/joint{k}",
+                                radius=float(self.joint_rad[k]),
+                                color=0xbcbcbc,
+                                opacity=1.0)
 
-        # flange as unit cylinder-like
-        uses_box_f = self.viz.add_unit_cylinder_like("robot/ur/flange", color=0x8f8f8f, opacity=1.0)
-        self._flange_xz_factor = 2.0 if uses_box_f else 1.0
-
-    def _end_overlap(self, endpoint_index: int) -> float:
-        """
-        endpoint_index refers to point idx in pts list:
-        pts: 0 base, 1..6 joint0..5, 7 ee
-        overlap applied for endpoints 1..6 (joint centers)
-        """
-        if 1 <= endpoint_index <= 6:
-            jr = self.joint_rad[endpoint_index - 1]
-            return float(self.overlap_frac * jr)
-        return 0.0
+        self.viz.add_cylinder_or_box("robot/ur/flange", length=0.038, radius=0.040,
+                                     color=0x8f8f8f, opacity=1.0)
 
     def update(self, pts: List[np.ndarray], ee_T: np.ndarray):
-        # segments: k connects pts[k] -> pts[k+1]
+        # pts length = 8 : base + 6 joints + ee
         for k in range(7):
             p0 = np.asarray(pts[k], dtype=float)
             p1 = np.asarray(pts[k + 1], dtype=float)
@@ -371,49 +359,35 @@ class URArmVisual:
             if dist < 1e-9:
                 continue
             d = v / dist
-
-            # overlap into joint spheres
-            ol = self._end_overlap(k)
-            or_ = self._end_overlap(k + 1)
-            L = dist + ol + or_
-
-            # asym overlap => shift center
-            center = (p0 + p1) * 0.5 + d * (or_ - ol) * 0.5
-
             R = align_y_to_dir(d)
-            r = self.seg_rad[k]
+            center = (p0 + p1) * 0.5
 
-            # unit cylinder scaled to real: radius=r, length=L
-            S = np.diag([self._seg_xz_factor * r, L, self._seg_xz_factor * r])
+            # IMPORTANT: only scale along cylinder axis (y) => radius never changes
+            sy = dist / max(self.seg_len_nom[k], 1e-6)
+            S = np.diag([1.0, sy, 1.0])
 
             T = np.eye(4)
             T[:3, :3] = R @ S
             T[:3, 3] = center
             self.viz.set_transform(f"robot/ur/seg{k}", T)
 
-        # joint spheres
         for k in range(6):
             pj = np.asarray(pts[1 + k], dtype=float)
-            jr = float(self.joint_rad[k])
             Tj = np.eye(4)
-            Tj[:3, :3] = np.diag([jr, jr, jr])
             Tj[:3, 3] = pj
             self.viz.set_transform(f"robot/ur/joint{k}", Tj)
 
-        # flange
-        flange_L = 0.038
-        flange_r = 0.040
         Rx90 = np.array([[1, 0, 0],
                          [0, 0, -1],
                          [0, 1, 0]], dtype=float)
         Tf = np.eye(4)
-        Tf[:3, :3] = (ee_T[:3, :3] @ Rx90) @ np.diag([self._flange_xz_factor * flange_r, flange_L, self._flange_xz_factor * flange_r])
+        Tf[:3, :3] = ee_T[:3, :3] @ Rx90
         Tf[:3, 3] = ee_T[:3, 3]
         self.viz.set_transform("robot/ur/flange", Tf)
 
 
 # =========================
-# Demo
+# Main Demo
 # =========================
 class UR3PickPlaceDemo:
     def __init__(self, scene: SceneConfig = SceneConfig(), plan: PlannerConfig = PlannerConfig()):
@@ -425,8 +399,7 @@ class UR3PickPlaceDemo:
         p.resetSimulation()
         p.setGravity(0, 0, -9.81)
         p.setTimeStep(self.plan.dt)
-        p.setPhysicsEngineParameter(numSolverIterations=300, deterministicOverlappingPairs=1)
-
+        p.setPhysicsEngineParameter(numSolverIterations=260)
         p.loadURDF("plane.urdf")
 
         self.viz = MeshcatBridge()
@@ -437,19 +410,20 @@ class UR3PickPlaceDemo:
 
         self._build_scene()
 
+        # Choose robot scale first (reach probe), then choose base placement on cab-ws line.
         self.ur_scale = self._choose_ur_scale()
-        self.robot_base_pos, self.robot_base_quat, self.robot_base_yaw = self._choose_base_pose_xy_align()
+        self.robot_base_pos, self.robot_base_quat, self.robot_base_yaw = self._choose_base_pose_strict_aligned()
 
         self._build_robot_and_mount()
         self._setup_control_and_visual()
         self.init_robot_state()
 
-        for _ in range(60):
+        for _ in range(30):
             p.stepSimulation()
             self._update_meshcat()
 
     # -----------------------
-    # Scene build
+    # Scene: build table/cabinet/workstation/phone
     # -----------------------
     def _create_static_box(self, center_xyz, size_xyz, friction=0.9) -> int:
         he = (np.asarray(size_xyz, dtype=float) / 2.0).tolist()
@@ -468,6 +442,7 @@ class UR3PickPlaceDemo:
 
     def _build_scene(self):
         sc = self.scene
+
         self.table_center_xy = np.array(sc.table_center_xy, dtype=float)
         self.table_surface_z = sc.table_h
 
@@ -527,19 +502,20 @@ class UR3PickPlaceDemo:
                                                  np.array([W, D, w], dtype=float),
                                                  color=0xa0a0a0, opacity=0.95, friction=0.8))
 
+        # mid shelf (creates 2 layers)
         shelf_width = W - 2 * w
         shelf_depth = D - w
         self.shelf_center = self.cab_center + np.array([0, 0, 0], dtype=float)
         self.cabinet_bodies.append(self._add_box("env/cab/shelf_mid",
                                                  self.shelf_center,
                                                  np.array([shelf_width, shelf_depth, shelf_t], dtype=float),
-                                                 color=0x8f8f8f, opacity=0.98, friction=0.95))
+                                                 color=0x8f8f8f, opacity=0.98, friction=0.9))
 
         # front frame (visual only)
         frame_t = 0.01
         frame_y = self.cab_center[1] - (D / 2 - frame_t / 2)
         frame_center = np.array([self.cab_center[0], frame_y, self.cab_center[2]], dtype=float)
-        self.viz.add_box("env/cab/front_frame", (W, frame_t, H), color=0xdddddd, opacity=0.10)
+        self.viz.add_box("env/cab/front_frame", (W, frame_t, H), color=0xdddddd, opacity=0.12)
         self.viz.set_transform("env/cab/front_frame", pose_to_T(frame_center, (0, 0, 0, 1)))
 
         self.cab_top_z = float(self.cab_center[2] + H / 2.0)
@@ -574,7 +550,6 @@ class UR3PickPlaceDemo:
         ]):
             self.workstation_bodies.append(self._add_box(f"env/ws/leg{i}", c, ws_leg,
                                                          color=0x4f4f4f, opacity=1.0, friction=0.95))
-
         self.ws_plate_center = np.array([ws_xy[0], ws_xy[1], ws_plate_z], dtype=float)
         self.ws_plate_size = ws_plate
         self.workstation_bodies.append(self._add_box("env/ws/plate", self.ws_plate_center, self.ws_plate_size,
@@ -585,7 +560,7 @@ class UR3PickPlaceDemo:
         self.viz.add_sphere("env/ws/target", 0.02, color=0x00ff00, opacity=1.0)
         self.viz.set_transform("env/ws/target", pose_to_T(self.ws_target, (0, 0, 0, 1)))
 
-        # phone on mid shelf
+        # phone on mid shelf (layer-1)
         phone_size = np.array(sc.phone_size, dtype=float)
         phone_z = self.shelf_top_z + float(phone_size[2] / 2.0)
         phone_y = self.cab_inner_front_y + float(phone_size[1] / 2.0) + 0.06
@@ -601,60 +576,16 @@ class UR3PickPlaceDemo:
         self.viz.add_box("objects/phone", tuple(phone_size.tolist()), color=0x111111, opacity=1.0)
         self.viz.set_transform("objects/phone", pose_to_T(self.phone_init_pos, (0, 0, 0, 1)))
 
-        # placeholders
+        # obstacles list
+        self.obstacles = [self.table_top_id] + self.cabinet_bodies + self.workstation_bodies
+
+        # pedestal & base frame (pose will be set after base chosen)
         self.ped_size = np.array(sc.pedestal_size, dtype=float)
         self.viz.add_box("robot/pedestal", tuple(self.ped_size.tolist()), color=0x555555, opacity=1.0)
         self.viz.add_frame("robot/base", length=0.18, radius=0.01)
 
-        self.obstacles = [self.table_top_id] + self.cabinet_bodies + self.workstation_bodies
-
     # -----------------------
-    # Base selection: STRICT XY align
-    # -----------------------
-    def _table_xy_bounds(self):
-        sc = self.scene
-        tx0 = self.table_center_xy[0] - sc.table_w / 2 + sc.table_margin
-        tx1 = self.table_center_xy[0] + sc.table_w / 2 - sc.table_margin
-        ty0 = self.table_center_xy[1] - sc.table_d / 2 + sc.table_margin
-        ty1 = self.table_center_xy[1] + sc.table_d / 2 - sc.table_margin
-        return tx0, tx1, ty0, ty1
-
-    def _base_yaw_to_face_cab(self, base_xy: np.ndarray) -> float:
-        v = np.array([self.cab_center[0] - base_xy[0],
-                      self.cab_center[1] - base_xy[1]], dtype=float)
-        return float(math.atan2(v[1], v[0]))
-
-    def _choose_base_pose_xy_align(self):
-        """
-        Requirement:
-        base_x = phone_x
-        base_y = workstation_y
-        yaw faces cabinet center.
-        """
-        tx0, tx1, ty0, ty1 = self._table_xy_bounds()
-
-        phone = self.phone_init_pos.copy()
-        ws = self.ws_target.copy()
-        base_xy = np.array([phone[0], ws[1]], dtype=float)
-
-        base_xy[0] = clamp(base_xy[0], tx0, tx1)
-        base_xy[1] = clamp(base_xy[1], ty0, ty1)
-
-        cab_W, cab_D, _ = self.scene.cab_outer
-        if (abs(base_xy[0] - self.cab_center[0]) < cab_W / 2 + 0.10) and \
-           (abs(base_xy[1] - self.cab_center[1]) < cab_D / 2 + 0.10):
-            base_xy[1] = clamp(self.cab_center[1] - (cab_D / 2 + 0.40), ty0, ty1)
-
-        yaw = self._base_yaw_to_face_cab(base_xy)
-        q = p.getQuaternionFromEuler([0, 0, yaw])
-
-        base = np.array([base_xy[0], base_xy[1], self.table_surface_z + self.scene.pedestal_size[2]], dtype=float)
-
-        print(f"[BaseSelect] base_xy={base_xy.tolist()} yaw(deg)={math.degrees(yaw):.1f}")
-        return base, q, yaw
-
-    # -----------------------
-    # Reach-aware scaling
+    # Robot scale + base selection (STRICT aligned)
     # -----------------------
     def _guess_ee_link_tmp(self, rid: int) -> int:
         num = p.getNumJoints(rid)
@@ -666,28 +597,29 @@ class UR3PickPlaceDemo:
         return rev[-1] if rev else num - 1
 
     def _choose_ur_scale(self) -> float:
+        # choose from a few scales to ensure reach (same as your previous iterations)
         ur_urdf = airo_models.get_urdf_path("ur3e")
         flags = p.URDF_USE_INERTIA_FROM_FILE | p.URDF_IGNORE_VISUAL_SHAPES
-
-        scales = [1.10, 1.20, 1.30, 1.40, 1.48]
+        scales = [1.00, 1.10, 1.20, 1.30]
         best_s, best_err = scales[0], 1e9
 
+        # probe target (near cabinet front, above phone)
         phone = self.phone_init_pos.copy()
-        probe = phone + np.array([0.0, -0.18, 0.10], dtype=float)
+        probe = phone + np.array([0.0, -0.10, 0.12], dtype=float)
 
-        base_xy = np.array([phone[0], self.ws_target[1]], dtype=float)
-        yaw = self._base_yaw_to_face_cab(base_xy)
-        qbase = p.getQuaternionFromEuler([0, 0, yaw])
+        # temporary base (rough) for scale selection
+        base_xy = self.cab_center[:2] + np.array([-0.65, -0.45], dtype=float)
         base_pos = np.array([base_xy[0], base_xy[1], self.table_surface_z + self.scene.pedestal_size[2]], dtype=float)
+        yaw = float(math.atan2(self.cab_center[1] - base_xy[1], self.cab_center[0] - base_xy[0]))
+        qbase = p.getQuaternionFromEuler([0, 0, yaw])
 
         for s in scales:
             rid = p.loadURDF(ur_urdf, basePosition=base_pos.tolist(),
                              baseOrientation=qbase, useFixedBase=True,
                              flags=flags, globalScaling=s)
             ee = self._guess_ee_link_tmp(rid)
-
             q = p.calculateInverseKinematics(rid, ee, probe.tolist(),
-                                             maxNumIterations=260, residualThreshold=1e-4)
+                                             maxNumIterations=220, residualThreshold=1e-4)
             for j in range(min(len(q), p.getNumJoints(rid))):
                 p.resetJointState(rid, j, float(q[j]))
             st = p.getLinkState(rid, ee, computeForwardKinematics=True)
@@ -700,92 +632,240 @@ class UR3PickPlaceDemo:
         print(f"[ReachScale] globalScaling={best_s:.2f} probe_err={best_err:.4f}m")
         return best_s
 
+    def _base_yaw_for_xy(self, base_xy: np.ndarray) -> float:
+        v = np.array([self.cab_center[0] - base_xy[0],
+                      self.cab_center[1] - base_xy[1]], dtype=float)
+        return float(math.atan2(v[1], v[0]))
+
+    def _table_xy_bounds(self) -> Tuple[float, float, float, float]:
+        sc = self.scene
+        tx0 = self.table_center_xy[0] - sc.table_w / 2 + sc.table_margin
+        tx1 = self.table_center_xy[0] + sc.table_w / 2 - sc.table_margin
+        ty0 = self.table_center_xy[1] - sc.table_d / 2 + sc.table_margin
+        ty1 = self.table_center_xy[1] + sc.table_d / 2 - sc.table_margin
+        return tx0, tx1, ty0, ty1
+
+    def _pick_base_on_cab_ws_line_candidates(self) -> List[np.ndarray]:
+        """
+        Generate base_xy candidates on (or near) the extension line of C<->W,
+        such that both cabinet center and workstation align in the same forward direction.
+        """
+        C = self.cab_center[:2].astype(float)
+        W = self.ws_target[:2].astype(float)
+
+        u = (C - W)
+        n = float(np.linalg.norm(u))
+        if n < 1e-9:
+            return []
+        u = u / n  # direction from W->C
+
+        # perpendicular for slight lateral offsets
+        perp = np.array([-u[1], u[0]], dtype=float)
+
+        tx0, tx1, ty0, ty1 = self._table_xy_bounds()
+
+        # distances behind cabinet (meters)
+        t_list = [0.55, 0.62, 0.70, 0.78, 0.86, 0.94]
+        off_list = [0.00, +0.04, -0.04, +0.08, -0.08]
+
+        cands = []
+        for t in t_list:
+            base_xy = C + u * t
+            for off in off_list:
+                b = base_xy + perp * off
+                if (tx0 <= b[0] <= tx1) and (ty0 <= b[1] <= ty1):
+                    cands.append(b)
+        return cands
+
+    def _critical_targets_for_scoring(self, base_xy: np.ndarray) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Build key EE targets (pos, quat) that must be reachable from this base pose.
+        We use the same orientation policy as planner.
+        """
+        phone = self.phone_init_pos.copy()
+        ws = self.ws_target.copy()
+
+        # pick orientation: forward +Y into cabinet, down -Z
+        q_pick = self.build_ee_quat_from_world_fwd_down(
+            fwd_w=np.array([0.0, 1.0, 0.0]),
+            down_w=np.array([0.0, 0.0, -1.0]),
+            ee_to_gripper_quat=np.array([0, 0, 0, 1], dtype=float)  # placeholder, replaced after mount in real
+        )
+
+        # place orientation: forward -Y (toward operator side), down -Z
+        q_place = self.build_ee_quat_from_world_fwd_down(
+            fwd_w=np.array([0.0, -1.0, 0.0]),
+            down_w=np.array([0.0, 0.0, -1.0]),
+            ee_to_gripper_quat=np.array([0, 0, 0, 1], dtype=float)
+        )
+
+        # safe heights (below cabinet top)
+        z_clear = min(self.cab_top_z - 0.08, phone[2] + 0.18)
+        y_edge = self.cab_front_y - 0.20
+
+        targets = [
+            (np.array([phone[0], y_edge, z_clear], dtype=float), q_pick),
+            (np.array([phone[0], phone[1], z_clear], dtype=float), q_pick),
+            (np.array([phone[0], phone[1], phone[2]], dtype=float), q_pick),
+            (np.array([ws[0], ws[1], max(self.ws_top_z + 0.20, z_clear)], dtype=float), q_place),
+        ]
+        return targets
+
+    def _score_base_candidate(self, base_xy: np.ndarray) -> Tuple[float, float]:
+        """
+        Score base candidate by IK error to critical targets.
+        Returns (total_score, max_err). Lower is better.
+        """
+        ur_urdf = airo_models.get_urdf_path("ur3e")
+        flags = p.URDF_USE_INERTIA_FROM_FILE | p.URDF_IGNORE_VISUAL_SHAPES
+
+        yaw = self._base_yaw_for_xy(base_xy)
+        qbase = p.getQuaternionFromEuler([0, 0, yaw])
+        base_pos = np.array([base_xy[0], base_xy[1], self.table_surface_z + self.scene.pedestal_size[2]], dtype=float)
+
+        rid = p.loadURDF(ur_urdf, basePosition=base_pos.tolist(),
+                         baseOrientation=qbase, useFixedBase=True,
+                         flags=flags, globalScaling=self.ur_scale)
+        try:
+            ee = self._guess_ee_link_tmp(rid)
+            total, max_err = 0.0, 0.0
+            targets = self._critical_targets_for_scoring(base_xy)
+            for tp, tq in targets:
+                q = p.calculateInverseKinematics(rid, ee, tp.tolist(),
+                                                 targetOrientation=tq.tolist(),
+                                                 maxNumIterations=220, residualThreshold=1e-4)
+                for j in range(min(len(q), p.getNumJoints(rid))):
+                    p.resetJointState(rid, j, float(q[j]))
+                st = p.getLinkState(rid, ee, computeForwardKinematics=True)
+                ee_pos = np.array(st[4], dtype=float)
+                err = float(np.linalg.norm(ee_pos - tp))
+                max_err = max(max_err, err)
+                total += 300.0 * err
+            return total, max_err
+        finally:
+            p.removeBody(rid)
+
+    def _choose_base_pose_strict_aligned(self) -> Tuple[np.ndarray, Tuple[float, float, float, float], float]:
+        """
+        Choose base_xy on cab-ws aligned line (or nearby) by scoring candidates.
+        Then set yaw to face cabinet center (base forward points to cabinet).
+        """
+        cands = self._pick_base_on_cab_ws_line_candidates()
+        if not cands:
+            # fallback
+            base_xy = self.cab_center[:2] + np.array([-0.70, -0.48], dtype=float)
+            yaw = self._base_yaw_for_xy(base_xy)
+            q = p.getQuaternionFromEuler([0, 0, yaw])
+            base = np.array([base_xy[0], base_xy[1], self.table_surface_z + self.scene.pedestal_size[2]], dtype=float)
+            print("[BaseSelect] fallback base_xy =", base_xy.tolist())
+            return base, q, yaw
+
+        best = None
+        for b in cands:
+            s, emax = self._score_base_candidate(b)
+            if best is None or s < best[0]:
+                best = (s, emax, b.copy())
+
+        _, emax, base_xy = best
+        yaw = self._base_yaw_for_xy(base_xy)
+        q = p.getQuaternionFromEuler([0, 0, yaw])
+        base = np.array([base_xy[0], base_xy[1], self.table_surface_z + self.scene.pedestal_size[2]], dtype=float)
+        print(f"[BaseSelect] aligned base_xy={base_xy.tolist()} yaw(deg)={math.degrees(yaw):.1f} max_err≈{emax:.4f}m")
+        return base, q, yaw
+
     # -----------------------
     # Robot load + mount
     # -----------------------
     def _build_robot_and_mount(self):
         ur_urdf = airo_models.get_urdf_path("ur3e")
         rq_urdf = airo_models.get_urdf_path("robotiq_2f_85")
-
         flags = (p.URDF_USE_INERTIA_FROM_FILE |
                  p.URDF_IGNORE_VISUAL_SHAPES |
                  p.URDF_USE_SELF_COLLISION)
 
-        self.robot_id = p.loadURDF(
-            ur_urdf,
-            basePosition=self.robot_base_pos.tolist(),
-            baseOrientation=self.robot_base_quat,
-            useFixedBase=True, flags=flags, globalScaling=self.ur_scale
-        )
-        self.gripper_id = p.loadURDF(
-            rq_urdf,
-            basePosition=self.robot_base_pos.tolist(),
-            baseOrientation=self.robot_base_quat,
-            useFixedBase=False, flags=flags, globalScaling=self.ur_scale
-        )
+        # load arm with strict base pose
+        self.robot_id = p.loadURDF(ur_urdf,
+                                   basePosition=self.robot_base_pos.tolist(),
+                                   baseOrientation=self.robot_base_quat,
+                                   useFixedBase=True, flags=flags, globalScaling=self.ur_scale)
+
+        # load gripper near base pose (will be constrained)
+        self.gripper_id = p.loadURDF(rq_urdf,
+                                     basePosition=self.robot_base_pos.tolist(),
+                                     baseOrientation=self.robot_base_quat,
+                                     useFixedBase=False, flags=flags, globalScaling=self.ur_scale)
 
         self.ee_link = self._guess_ee_link_tmp(self.robot_id)
 
-        p.createConstraint(
-            self.robot_id, self.ee_link,
-            self.gripper_id, -1,
-            p.JOINT_FIXED, [0, 0, 0],
-            [0, 0, 0], [0, 0, 0],
-            [0, 0, 0, 1], [0, 0, 0, 1]
-        )
+        # mount gripper rigidly to ee
+        p.createConstraint(self.robot_id, self.ee_link,
+                           self.gripper_id, -1,
+                           p.JOINT_FIXED, [0, 0, 0],
+                           [0, 0, 0], [0, 0, 0],
+                           [0, 0, 0, 1], [0, 0, 0, 1])
 
+        # update pedestal + base frames
         ped_center = np.array([self.robot_base_pos[0], self.robot_base_pos[1],
                                self.table_surface_z + self.scene.pedestal_size[2] / 2.0], dtype=float)
         self.viz.set_transform("robot/pedestal", pose_to_T(ped_center, self.robot_base_quat))
         self.viz.set_transform("robot/base", pose_to_T(self.robot_base_pos.tolist(), self.robot_base_quat))
 
     # -----------------------
-    # Joint selection (strict)
+    # Joints / Limits / Visual setup
     # -----------------------
-    def _select_arm_joints_strict(self) -> List[int]:
-        preferred = [
-            "shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
-            "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"
-        ]
+    def _select_arm_joints(self) -> List[int]:
         num = p.getNumJoints(self.robot_id)
-        name_to_index = {}
-        for j in range(num):
-            info = p.getJointInfo(self.robot_id, j)
-            if info[2] != p.JOINT_REVOLUTE:
-                continue
-            jname = info[1].decode("utf-8")
-            name_to_index[jname] = j
+        movable = [j for j in range(num) if p.getJointInfo(self.robot_id, j)[2] in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC)]
+        name_map = {j: p.getJointInfo(self.robot_id, j)[1].decode("utf-8") for j in movable}
+        preferred = ["shoulder_pan_joint", "shoulder_lift_joint", "elbow_joint",
+                     "wrist_1_joint", "wrist_2_joint", "wrist_3_joint"]
+        chosen = []
+        for nm in preferred:
+            for j, jn in name_map.items():
+                if jn == nm:
+                    chosen.append(j)
+                    break
+        if len(chosen) == 6:
+            return chosen
+        rev = [j for j in movable if p.getJointInfo(self.robot_id, j)[2] == p.JOINT_REVOLUTE]
+        return rev[:6]
 
-        missing = [nm for nm in preferred if nm not in name_to_index]
-        if missing:
-            raise RuntimeError(
-                f"[FATAL] UR joints missing={missing}. Found revolute={list(name_to_index.keys())}"
-            )
-        return [name_to_index[nm] for nm in preferred]
+    def _estimate_link_radius(self, body_id: int, link_index: int) -> float:
+        try:
+            aabb_min, aabb_max = p.getAABB(body_id, link_index)
+            ext = np.array(aabb_max, dtype=float) - np.array(aabb_min, dtype=float)
+            s = np.sort(ext)
+            thickness = float(max(s[0], s[1]))
+            r = 0.5 * thickness
+            return float(np.clip(r * 0.85, 0.015, 0.048))
+        except Exception:
+            return 0.028
 
     def _setup_control_and_visual(self):
-        self.arm_joints = self._select_arm_joints_strict()
-        print("[Debug] arm joints indices:", self.arm_joints)
-
+        self.arm_joints = self._select_arm_joints()
         self.movable_joints = [j for j in range(p.getNumJoints(self.robot_id))
                                if p.getJointInfo(self.robot_id, j)[2] in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC)]
         self.movable_index = {j: i for i, j in enumerate(self.movable_joints)}
 
+        # limits for IK: use URDF if present; if continuous, keep large but finite
         cont = math.radians(359.0)
         self.joint_limit_by_index: Dict[int, Tuple[float, float]] = {}
-        self.lower, self.upper, self.ranges = [], [], []
+        self.lower, self.upper, self.ranges, self.damping = [], [], [], []
         for j in self.movable_joints:
             info = p.getJointInfo(self.robot_id, j)
+            if info[2] not in (p.JOINT_REVOLUTE, p.JOINT_PRISMATIC):
+                continue
             lo, hi = float(info[8]), float(info[9])
             if abs(hi - lo) < 1e-9:
                 lo, hi = -cont, +cont
             if (hi - lo) > math.radians(720.0):
                 lo, hi = -cont, +cont
             self.joint_limit_by_index[j] = (lo, hi)
-            self.lower.append(lo)
-            self.upper.append(hi)
+            self.lower.append(lo); self.upper.append(hi)
             self.ranges.append(max(hi - lo, 1e-6))
+            self.damping.append(self.plan.joint_damping)
 
+        # gripper joints
         gnum = p.getNumJoints(self.gripper_id)
         self.gripper_joints = [j for j in range(gnum)
                                if p.getJointInfo(self.gripper_id, j)[2] in (p.JOINT_PRISMATIC, p.JOINT_REVOLUTE)]
@@ -796,19 +876,38 @@ class UR3PickPlaceDemo:
                 lo, hi = 0.0, 0.8
             self.gripper_limits.append((lo, hi))
 
-        # UR-like taper (thin, industrial)
-        seg_rad = [0.029, 0.028, 0.026, 0.025, 0.023, 0.0215, 0.020]
-        self.arm_vis.create(seg_rad)
+        # build arm visuals (probe distances)
+        for j in self.arm_joints:
+            p.resetJointState(self.robot_id, j, 0.0)
+        p.stepSimulation()
 
-        # gripper visuals
+        pts = self._get_visual_chain_points()
+        seg_nom = [float(np.linalg.norm(pts[k + 1] - pts[k])) for k in range(7)]
+        link_r = [self._estimate_link_radius(self.robot_id, j) for j in self.arm_joints]
+
+        # fixed radii per segment (industrial tapering)
+        seg_rad = [
+            max(link_r[0] * 1.02, 0.020),
+            max(min(link_r[0], link_r[1]) * 0.98, 0.018),
+            max(min(link_r[1], link_r[2]) * 0.97, 0.017),
+            max(min(link_r[2], link_r[3]) * 0.96, 0.016),
+            max(min(link_r[3], link_r[4]) * 0.95, 0.0155),
+            max(min(link_r[4], link_r[5]) * 0.94, 0.0150),
+            max(link_r[5] * 0.94, 0.0150),
+        ]
+        joint_rad = [clamp(0.78 * max(seg_rad[i], seg_rad[min(i + 1, 6)]) + 0.002, 0.018, 0.036)
+                     for i in range(6)]
+        self.arm_vis.create(seg_nom, seg_rad, joint_rad)
+
+        # simple gripper visuals
         self.viz.add_box("robot/gripper/base", (0.085, 0.045, 0.045), color=0x222222, opacity=1.0)
         self.viz.add_box("robot/gripper/fingerL", (0.018, 0.095, 0.02), color=0x333333, opacity=1.0)
         self.viz.add_box("robot/gripper/fingerR", (0.018, 0.095, 0.02), color=0x333333, opacity=1.0)
 
-        # wrist RGBD frame
+        # wrist camera frame (visual only)
         self.viz.add_frame("robot/wrist_rgbd", length=0.10, radius=0.006)
 
-        # ee->gripper transform
+        # compute ee->gripper transform
         self.set_gripper(0.0)
         for _ in range(10):
             p.stepSimulation()
@@ -820,7 +919,10 @@ class UR3PickPlaceDemo:
         self.ee_to_gripper_pos = np.array(rel_pos, dtype=float)
         self.ee_to_gripper_quat = np.array(rel_quat, dtype=float)
 
-        self.obstacles = [self.table_top_id] + self.cabinet_bodies + self.workstation_bodies
+        print("[Debug] base_pos:", self.robot_base_pos.tolist())
+        print("[Debug] base_yaw(deg):", math.degrees(self.robot_base_yaw))
+        print("[Debug] arm joints:", self.arm_joints)
+        print("[Debug] ee link:", self.ee_link)
 
     def get_joint_limit(self, joint_index: int) -> Tuple[float, float]:
         return self.joint_limit_by_index.get(joint_index, (-math.radians(359), math.radians(359)))
@@ -828,60 +930,31 @@ class UR3PickPlaceDemo:
     def get_arm_q(self) -> List[float]:
         return [p.getJointState(self.robot_id, j)[0] for j in self.arm_joints]
 
-    # -----------------------
-    # Control
-    # -----------------------
-    def lock_arm_targets(self, q_arm: Optional[List[float]] = None,
-                         kp: Optional[float] = None, kd: Optional[float] = None,
-                         force: Optional[float] = None):
+    def lock_arm_targets(self, q_arm: Optional[List[float]] = None):
         if q_arm is None:
             q_arm = self.get_arm_q()
-        kp = self.plan.kp if kp is None else kp
-        kd = self.plan.kd if kd is None else kd
-        force = self.plan.max_force if force is None else force
-
-        q_cmd = []
-        for qi, ji in zip(q_arm, self.arm_joints):
+        for ji, qv in zip(self.arm_joints, q_arm):
             lo, hi = self.get_joint_limit(ji)
-            q_cmd.append(clamp(float(qi), lo, hi))
+            qv = clamp(float(qv), lo, hi)
+            p.setJointMotorControl2(self.robot_id, ji, p.POSITION_CONTROL,
+                                    targetPosition=qv, targetVelocity=0.0,
+                                    positionGain=0.30, velocityGain=1.0,
+                                    force=420)
 
-        p.setJointMotorControlArray(
-            self.robot_id,
-            jointIndices=self.arm_joints,
-            controlMode=p.POSITION_CONTROL,
-            targetPositions=q_cmd,
-            targetVelocities=[0.0] * 6,
-            positionGains=[kp] * 6,
-            velocityGains=[kd] * 6,
-            forces=[force] * 6
-        )
+    # -----------------------
+    # Visual chain points
+    # -----------------------
+    def _joint_pivot_pos(self, joint_index: int) -> np.ndarray:
+        st = p.getLinkState(self.robot_id, joint_index, computeForwardKinematics=True)
+        return np.array(st[4], dtype=float)
 
-    def _ensure_motion_or_boost(self, q_target: List[float], tag: str):
-        cur0 = self.get_arm_q()
-        err0 = max(abs(a - b) for a, b in zip(cur0, q_target))
-        if err0 < 1e-3:
-            return
-
-        best_err = err0
-        for _ in range(self.plan.auto_boost_steps):
-            self.lock_arm_targets(q_target)
-            p.stepSimulation()
-            self._update_meshcat()
-            if self.plan.realtime:
-                time.sleep(self.plan.dt)
-            cur = self.get_arm_q()
-            err = max(abs(a - b) for a, b in zip(cur, q_target))
-            best_err = min(best_err, err)
-            if err < 0.6 * err0:
-                return
-
-        print(f"[WARN][{tag}] Arm stuck (err {err0:.3f}->{best_err:.3f}). Boosting.")
-        for _ in range(int(0.7 / self.plan.dt)):
-            self.lock_arm_targets(q_target, kp=self.plan.auto_boost_kp, kd=self.plan.kd, force=self.plan.auto_boost_force)
-            p.stepSimulation()
-            self._update_meshcat()
-            if self.plan.realtime:
-                time.sleep(self.plan.dt)
+    def _get_visual_chain_points(self) -> List[np.ndarray]:
+        base_pos, _ = p.getBasePositionAndOrientation(self.robot_id)
+        base_anchor = np.array(base_pos, dtype=float)
+        joint_pts = [self._joint_pivot_pos(j) for j in self.arm_joints]
+        st = p.getLinkState(self.robot_id, self.ee_link, computeForwardKinematics=True)
+        ee_pos = np.array(st[4], dtype=float)
+        return [base_anchor] + joint_pts + [ee_pos]
 
     # -----------------------
     # Gripper
@@ -891,35 +964,7 @@ class UR3PickPlaceDemo:
         self.gripper_close_frac = close_fraction
         for (j, (lo, hi)) in zip(self.gripper_joints, self.gripper_limits):
             tgt = lo + close_fraction * (hi - lo)
-            p.setJointMotorControl2(self.gripper_id, j, p.POSITION_CONTROL, targetPosition=float(tgt), force=320)
-
-    # -----------------------
-    # TRUE joint pivots (fix scatter)
-    # -----------------------
-    def _link_world_pose(self, link_index: int):
-        if link_index == -1:
-            pos, quat = p.getBasePositionAndOrientation(self.robot_id)
-            return pos, quat
-        st = p.getLinkState(self.robot_id, link_index, computeForwardKinematics=True)
-        return st[4], st[5]
-
-    def _joint_pivot_world(self, joint_index: int) -> np.ndarray:
-        info = p.getJointInfo(self.robot_id, joint_index)
-        parent_frame_pos = info[14]
-        parent_frame_orn = info[15]
-        parent_index = info[16]
-        parent_pos, parent_quat = self._link_world_pose(parent_index)
-        wpos, _ = p.multiplyTransforms(parent_pos, parent_quat, parent_frame_pos, parent_frame_orn)
-        return np.array(wpos, dtype=float)
-
-    def _get_visual_chain_points(self) -> List[np.ndarray]:
-        base_pos, _ = p.getBasePositionAndOrientation(self.robot_id)
-        pts = [np.array(base_pos, dtype=float)]
-        for j in self.arm_joints:
-            pts.append(self._joint_pivot_world(j))
-        st = p.getLinkState(self.robot_id, self.ee_link, computeForwardKinematics=True)
-        pts.append(np.array(st[4], dtype=float))
-        return pts
+            p.setJointMotorControl2(self.gripper_id, j, p.POSITION_CONTROL, targetPosition=float(tgt), force=220)
 
     # -----------------------
     # Orientation helpers
@@ -930,53 +975,25 @@ class UR3PickPlaceDemo:
     def _quat_inv(self, q):
         return p.invertTransform([0, 0, 0], q)[1]
 
-    def build_ee_quat_from_world_fwd_down(self, fwd_w: np.ndarray, down_w: np.ndarray) -> np.ndarray:
-        fwd = np.asarray(fwd_w, dtype=float)
-        down = np.asarray(down_w, dtype=float)
-        fwd = fwd / max(np.linalg.norm(fwd), 1e-9)
-        down = down / max(np.linalg.norm(down), 1e-9)
+    def build_ee_quat_from_world_fwd_down(self, fwd_w: np.ndarray, down_w: np.ndarray,
+                                          ee_to_gripper_quat: np.ndarray) -> np.ndarray:
+        """
+        Build EE quaternion so that gripper forward axis aligns with fwd_w and gripper down aligns with down_w.
+        We then compensate by EE->gripper quaternion so that after mounting, the GRIPPER has desired orientation.
+        """
+        fwd = fwd_w / max(np.linalg.norm(fwd_w), 1e-9)
+        down = down_w / max(np.linalg.norm(down_w), 1e-9)
         left = np.cross(down, fwd)
         left = left / max(np.linalg.norm(left), 1e-9)
         fwd = np.cross(left, down)
         Rg = np.stack([left, fwd, down], axis=1)
         Rg = orthonormalize(Rg)
-
-        tr = Rg[0, 0] + Rg[1, 1] + Rg[2, 2]
-        if tr > 0:
-            S = math.sqrt(tr + 1.0) * 2
-            w = 0.25 * S
-            x = (Rg[2, 1] - Rg[1, 2]) / S
-            y = (Rg[0, 2] - Rg[2, 0]) / S
-            z = (Rg[1, 0] - Rg[0, 1]) / S
-            qg = (x, y, z, w)
-        else:
-            i = int(np.argmax([Rg[0, 0], Rg[1, 1], Rg[2, 2]]))
-            if i == 0:
-                S = math.sqrt(1.0 + Rg[0, 0] - Rg[1, 1] - Rg[2, 2]) * 2
-                w = (Rg[2, 1] - Rg[1, 2]) / S
-                x = 0.25 * S
-                y = (Rg[0, 1] + Rg[1, 0]) / S
-                z = (Rg[0, 2] + Rg[2, 0]) / S
-            elif i == 1:
-                S = math.sqrt(1.0 + Rg[1, 1] - Rg[0, 0] - Rg[2, 2]) * 2
-                w = (Rg[0, 2] - Rg[2, 0]) / S
-                x = (Rg[0, 1] + Rg[1, 0]) / S
-                y = 0.25 * S
-                z = (Rg[1, 2] + Rg[2, 1]) / S
-            else:
-                S = math.sqrt(1.0 + Rg[2, 2] - Rg[0, 0] - Rg[1, 1]) * 2
-                w = (Rg[1, 0] - Rg[0, 1]) / S
-                x = (Rg[0, 2] + Rg[2, 0]) / S
-                y = (Rg[1, 2] + Rg[2, 1]) / S
-                z = 0.25 * S
-            qg = (x, y, z, w)
-
-        qg = np.array(qg, dtype=float)
-        q_ee = self._quat_mul(qg.tolist(), self._quat_inv(self.ee_to_gripper_quat.tolist()))
+        qg = np.array(quat_from_R(Rg), dtype=float)
+        q_ee = self._quat_mul(qg, self._quat_inv(ee_to_gripper_quat))
         return np.array(q_ee, dtype=float)
 
     # -----------------------
-    # IK (continuous)
+    # IK with continuity
     # -----------------------
     def _wrap_near(self, q: float, ref: float) -> float:
         two_pi = 2.0 * math.pi
@@ -985,6 +1002,7 @@ class UR3PickPlaceDemo:
         return ref + dq
 
     def ik_limited(self, target_pos, target_quat_xyzw, seed_arm_q: List[float]) -> List[float]:
+        # restPoses over movable joints
         rest_m = [0.0] * len(self.movable_joints)
         for k, j in enumerate(self.arm_joints):
             rest_m[self.movable_index[j]] = float(seed_arm_q[k])
@@ -995,18 +1013,20 @@ class UR3PickPlaceDemo:
             lowerLimits=self.lower, upperLimits=self.upper,
             jointRanges=self.ranges, restPoses=rest_m,
             jointDamping=[self.plan.joint_damping] * len(self.lower),
-            solver=p.IK_DLS, maxNumIterations=420, residualThreshold=1e-4
+            solver=p.IK_DLS, maxNumIterations=360, residualThreshold=1e-4
         )
         q_sol = list(q_sol)
+        numJ = p.getNumJoints(self.robot_id)
 
         if len(q_sol) == len(self.movable_joints):
             q_map = {j: q_sol[i] for i, j in enumerate(self.movable_joints)}
-            q_arm = [float(q_map[j]) for j in self.arm_joints]
-        elif len(q_sol) == p.getNumJoints(self.robot_id):
+            q_arm = [float(q_map[self.arm_joints[k]]) for k in range(6)]
+        elif len(q_sol) == numJ:
             q_arm = [float(q_sol[j]) for j in self.arm_joints]
         else:
             q_arm = list(seed_arm_q)
 
+        # continuity + delta cap + clamp
         out = []
         for qi, ri in zip(q_arm, seed_arm_q):
             qi = self._wrap_near(float(qi), float(ri))
@@ -1015,15 +1035,16 @@ class UR3PickPlaceDemo:
                 qi = float(ri) + math.copysign(self.plan.max_step_delta_rad, d)
             out.append(float(qi))
 
+        q_arm = out
         for i, j in enumerate(self.arm_joints):
             lo, hi = self.get_joint_limit(j)
-            out[i] = clamp(out[i], lo, hi)
-        return out
+            q_arm[i] = clamp(float(q_arm[i]), lo, hi)
+        return q_arm
 
     # -----------------------
-    # Collision checks
+    # Collision helpers
     # -----------------------
-    def _compute_gripper_world_from_ee(self):
+    def _compute_gripper_world_from_ee(self) -> Tuple[np.ndarray, np.ndarray]:
         st = p.getLinkState(self.robot_id, self.ee_link, computeForwardKinematics=True)
         ee_pos, ee_quat = st[4], st[5]
         gpos, gquat = p.multiplyTransforms(
@@ -1057,18 +1078,20 @@ class UR3PickPlaceDemo:
         return False
 
     # -----------------------
-    # Interpolation
+    # Interpolation (Cartesian + joint densify)
     # -----------------------
-    def interpolate_pose_list(self, p0, q0, p1, q1):
+    def interpolate_pose_list(self, p0, q0, p1, q1) -> List[Tuple[np.ndarray, np.ndarray]]:
         p0 = np.asarray(p0, dtype=float)
         p1 = np.asarray(p1, dtype=float)
         q0 = np.asarray(q0, dtype=float)
         q1 = np.asarray(q1, dtype=float)
+
         dist = float(np.linalg.norm(p1 - p0))
         ang = float(quat_angle_deg(q0, q1))
         n_pos = max(1, int(math.ceil(dist / self.plan.cart_step)))
         n_ang = max(1, int(math.ceil(ang / self.plan.ang_step_deg)))
         n = max(n_pos, n_ang)
+
         out = []
         for i in range(n + 1):
             t = i / n
@@ -1089,16 +1112,25 @@ class UR3PickPlaceDemo:
             n = max(1, int(math.ceil(dq / max_dq)))
             for k in range(1, n + 1):
                 t = k / n
-                out.append(((1 - t) * qa + t * qb).tolist())
-        return out
+                out.append((1 - t) * qa + t * qb)
+        return [list(map(float, x)) for x in out]
 
     # -----------------------
-    # Shortest-path planning among candidates
+    # Planning (Cartesian -> IK -> collision check)
     # -----------------------
-    def plan_cartesian_raw(self, waypoints: List[Waypoint]):
+    def _viz_plan(self, name: str, wps: List[Waypoint], path_xyz: np.ndarray):
+        for i, wp in enumerate(wps):
+            key = f"plan/{name}/wp{i}_{wp.name}"
+            self.viz.add_sphere(key, 0.012, color=0xffaa00, opacity=1.0)
+            self.viz.set_transform(key, pose_to_T(wp.pos, (0, 0, 0, 1)))
+        if path_xyz is not None and len(path_xyz) > 2:
+            self.viz.add_polyline(f"plan/{name}/path", path_xyz, color=0xffaa00, opacity=0.85)
+
+    def plan_cartesian_raw(self, waypoints: List[Waypoint]) -> Tuple[List[List[float]], np.ndarray]:
         q_seed = self.get_arm_q()
-        q_traj = []
-        ee_path = []
+        q_traj: List[List[float]] = []
+        ee_path: List[np.ndarray] = []
+
         for a, b in zip(waypoints[:-1], waypoints[1:]):
             interp = self.interpolate_pose_list(a.pos, a.quat, b.pos, b.quat)
             if ee_path:
@@ -1108,48 +1140,20 @@ class UR3PickPlaceDemo:
                 q_traj.append(q)
                 ee_path.append(np.asarray(pos, dtype=float))
                 q_seed = q
+
         q_traj = self.densify_joint_traj(q_traj)
         return q_traj, (np.array(ee_path, dtype=float) if ee_path else np.zeros((0, 3), dtype=float))
 
-    def _traj_cost(self, q_traj: List[List[float]], ee_path: np.ndarray) -> float:
-        if len(q_traj) < 2:
-            return 1e9
-        ee_len = 0.0
-        if ee_path is not None and len(ee_path) >= 2:
-            dif = ee_path[1:] - ee_path[:-1]
-            ee_len = float(np.sum(np.linalg.norm(dif, axis=1)))
-        q = np.array(q_traj, dtype=float)
-        dq = np.abs(q[1:] - q[:-1])
-        joint_cost = float(np.sum(dq))
-        return self.plan.cost_w_ee * ee_len + self.plan.cost_w_joint * joint_cost
-
-    def _viz_plan(self, name: str, wps: List[Waypoint], path_xyz: np.ndarray):
-        for i, wp in enumerate(wps):
-            key = f"plan/{name}/wp{i}_{wp.name}"
-            self.viz.add_sphere(key, 0.012, color=0xffaa00, opacity=1.0)
-            self.viz.set_transform(key, pose_to_T(wp.pos, (0, 0, 0, 1)))
-        if path_xyz is not None and len(path_xyz) > 2:
-            self.viz.add_polyline(f"plan/{name}/path", path_xyz, color=0xffaa00, opacity=0.85)
-
-    def plan_cartesian_avoid_shortest(self, name: str, builder: Callable[[int], List[Waypoint]]) -> List[List[float]]:
+    def plan_cartesian_avoid(self, name: str, builder: Callable[[int], List[Waypoint]]) -> List[List[float]]:
         state_id = p.saveState()
-        best = None  # (cost, traj, wps, path)
-        last_any = None
-
-        result_traj: List[List[float]] = []
-        result_wps: Optional[List[Waypoint]] = None
-        result_path: Optional[np.ndarray] = None
-
+        last = ([], None, None)
         try:
             for attempt in range(self.plan.max_replan_tries):
                 p.restoreState(state_id)
-                self.lock_arm_targets(self.get_arm_q())
+                self.lock_arm_targets()
 
                 wps = builder(attempt)
                 traj, path = self.plan_cartesian_raw(wps)
-
-                if len(traj) == 0:
-                    continue
 
                 collision = False
                 for q in traj:
@@ -1157,29 +1161,15 @@ class UR3PickPlaceDemo:
                         collision = True
                         break
 
-                last_any = (traj, wps, path)
-                if collision:
-                    continue
+                last = (traj, wps, path)
+                if (not collision) and len(traj) > 0:
+                    self._viz_plan(name, wps, path)
+                    return traj
 
-                cost = self._traj_cost(traj, path)
-                if (best is None) or (cost < best[0]):
-                    best = (cost, traj, wps, path)
-
-            if best is None:
-                if last_any is not None:
-                    result_traj, result_wps, result_path = last_any
-                else:
-                    result_traj, result_wps, result_path = [], None, None
-            else:
-                _, result_traj, result_wps, result_path = best
-
-            # IMPORTANT: restore sim state so planning doesn't "leave" robot at a sampled pose
-            p.restoreState(state_id)
-
-            if result_wps is not None and result_path is not None:
-                self._viz_plan(name, result_wps, result_path)
-
-            return result_traj
+            traj, wps, path = last
+            if wps is not None and path is not None:
+                self._viz_plan(name, wps, path)
+            return traj
         finally:
             try:
                 p.removeState(state_id)
@@ -1189,6 +1179,15 @@ class UR3PickPlaceDemo:
     # -----------------------
     # Execution
     # -----------------------
+    def _warn_limits(self, q_traj: List[List[float]], tag: str):
+        for k, ji in enumerate(self.arm_joints):
+            lo, hi = self.get_joint_limit(ji)
+            mn = min(q[k] for q in q_traj)
+            mx = max(q[k] for q in q_traj)
+            if (mn - lo) < self.plan.limit_warn_rad or (hi - mx) < self.plan.limit_warn_rad:
+                name = p.getJointInfo(self.robot_id, ji)[1].decode("utf-8")
+                print(f"[WARN][{tag}] joint '{name}' near limit: range=[{mn:.3f},{mx:.3f}] limits=[{lo:.3f},{hi:.3f}]")
+
     def wait_until_reached(self, q_target: List[float], timeout_s: float) -> bool:
         t0 = time.time()
         while True:
@@ -1209,7 +1208,7 @@ class UR3PickPlaceDemo:
         if not q_traj:
             raise RuntimeError(f"[{name}] Empty trajectory (planning failed).")
 
-        self._ensure_motion_or_boost(q_traj[0], tag=f"{name}/first")
+        self._warn_limits(q_traj, tag=name)
 
         for q in q_traj:
             for _ in range(self.plan.knot_ticks):
@@ -1225,11 +1224,12 @@ class UR3PickPlaceDemo:
 
         ok = self.wait_until_reached(q_traj[-1], timeout_s=self.plan.settle_timeout_s)
         if not ok:
-            print(f"[WARN][{name}] final convergence not perfect; locking anyway.")
+            print(f"[WARN][{name}] did not fully converge to final knot; locking anyway.")
         self.lock_arm_targets(q_traj[-1])
 
     def hold(self, seconds: float):
-        self.lock_arm_targets(self.get_arm_q())
+        # keep holding targets (no drift)
+        self.lock_arm_targets()
         steps = max(1, int(seconds * 60))
         for _ in range(steps):
             p.stepSimulation()
@@ -1238,7 +1238,7 @@ class UR3PickPlaceDemo:
                 time.sleep(1.0 / 60)
 
     # -----------------------
-    # Attach / Detach phone
+    # Phone attach/detach
     # -----------------------
     def try_attach_phone(self) -> bool:
         if self.phone_constraint is not None:
@@ -1246,15 +1246,16 @@ class UR3PickPlaceDemo:
         if self.gripper_close_frac < 0.86:
             return False
 
-        gpos, _ = p.getBasePositionAndOrientation(self.gripper_id)
-        gpos = np.array(gpos, dtype=float)
+        st = p.getLinkState(self.robot_id, self.ee_link, computeForwardKinematics=True)
+        ee_pos = np.array(st[4], dtype=float)
+
         opos, _ = p.getBasePositionAndOrientation(self.phone_id)
         opos = np.array(opos, dtype=float)
-
-        if float(np.linalg.norm(gpos - opos)) > 0.085:
+        if float(np.linalg.norm(ee_pos - opos)) > 0.095:
             return False
 
-        inv_gpos, inv_gquat = p.invertTransform(gpos.tolist(), p.getBasePositionAndOrientation(self.gripper_id)[1])
+        gpos, gquat = p.getBasePositionAndOrientation(self.gripper_id)
+        inv_gpos, inv_gquat = p.invertTransform(gpos, gquat)
         rel_pos, rel_quat = p.multiplyTransforms(inv_gpos, inv_gquat, opos.tolist(), [0, 0, 0, 1])
 
         self.phone_constraint = p.createConstraint(
@@ -1275,8 +1276,21 @@ class UR3PickPlaceDemo:
     def _zero_phone_velocity(self):
         p.resetBaseVelocity(self.phone_id, [0, 0, 0], [0, 0, 0])
 
+    def snap_phone_to_ws_if_close(self):
+        if not self.scene.snap_place:
+            return
+        pos, _ = p.getBasePositionAndOrientation(self.phone_id)
+        pos = np.array(pos, dtype=float)
+        dxy = float(np.linalg.norm(pos[:2] - self.ws_target[:2]))
+        if dxy <= self.scene.snap_xy_tol:
+            z = self.ws_top_z + self.scene.phone_size[2] / 2.0 + 0.002
+            p.resetBasePositionAndOrientation(self.phone_id,
+                                              [self.ws_target[0], self.ws_target[1], z],
+                                              [0, 0, 0, 1])
+            self._zero_phone_velocity()
+
     # -----------------------
-    # Visual update
+    # MeshCat update
     # -----------------------
     def _update_meshcat(self):
         base_pos, base_quat = p.getBasePositionAndOrientation(self.robot_id)
@@ -1287,10 +1301,12 @@ class UR3PickPlaceDemo:
         ee_T = pose_to_T(st[4], st[5])
         self.arm_vis.update(pts, ee_T)
 
+        # gripper visuals
         gpos, gquat = p.getBasePositionAndOrientation(self.gripper_id)
         T_g = pose_to_T(gpos, gquat)
         self.viz.set_transform("robot/gripper/base", T_g)
 
+        # simple finger animation by gap
         max_gap = 0.085
         min_gap = 0.006
         gap = (1.0 - self.gripper_close_frac) * (max_gap - min_gap) + min_gap
@@ -1300,18 +1316,21 @@ class UR3PickPlaceDemo:
         self.viz.set_transform("robot/gripper/fingerL", T_g @ T_L)
         self.viz.set_transform("robot/gripper/fingerR", T_g @ T_R)
 
+        # wrist rgbd camera frame: put it at flange forward a bit (visual)
+        # (This is a visual frame only; you can add real p.getCameraImage if needed.)
         Tw = np.eye(4)
         Tw[:3, 3] = np.array([0.0, 0.06, 0.02], dtype=float)
         self.viz.set_transform("robot/wrist_rgbd", ee_T @ Tw)
 
+        # phone
         phone_pos, phone_quat = p.getBasePositionAndOrientation(self.phone_id)
         self.viz.set_transform("objects/phone", pose_to_T(phone_pos, phone_quat))
 
     # -----------------------
-    # Init pose
+    # Init
     # -----------------------
     def init_robot_state(self):
-        # UR-like init facing cabinet, minimal weird twisting
+        # Base already faces cabinet; this init pose matches UR-style “natural bend”
         q_init = [0.0, -1.05, 1.55, -1.70, -1.57, 0.0]
         for i, ji in enumerate(self.arm_joints):
             lo, hi = self.get_joint_limit(ji)
@@ -1322,146 +1341,168 @@ class UR3PickPlaceDemo:
         self.set_gripper(0.0)
         self.lock_arm_targets(q_init)
 
-        for _ in range(int(0.7 / self.plan.dt)):
+        # settle
+        for _ in range(int(0.6 / self.plan.dt)):
             p.stepSimulation()
             self._update_meshcat()
             if self.plan.realtime:
                 time.sleep(self.plan.dt)
 
-        print("[Init] Arm locked & stable, gripper opened. (No motion before commands.)")
+        print("[Init] base strictly aligned (cabinet+ws forward); arm stable; gripper opened.")
 
     # -----------------------
-    # Planning: Pick / Retract / Place (shortest among collision-free)
+    # Pose helpers
     # -----------------------
     def ee_world_pos(self) -> np.ndarray:
         st = p.getLinkState(self.robot_id, self.ee_link, computeForwardKinematics=True)
         return np.array(st[4], dtype=float)
 
-    def _height_policy_low(self, phone_pos: np.ndarray, attempt: int):
-        z_inside = float(min(self.cab_top_z - 0.10, phone_pos[2] + 0.095 + 0.003 * attempt))
-        z_outside = float(max(self.table_surface_z + 0.26, self.ws_top_z + 0.10))
-        return z_inside, z_outside
+    def is_inside_cabinet(self, pos_xyz: np.ndarray) -> bool:
+        y = float(pos_xyz[1])
+        x = float(pos_xyz[0])
+        z = float(pos_xyz[2])
+        inside_y = (self.cab_inner_front_y <= y <= self.cab_inner_back_y)
+        inside_x = (abs(x - self.cab_center[0]) <= self.cab_inner_w / 2.0)
+        inside_z = (self.table_surface_z <= z <= self.cab_top_z)
+        return inside_y and inside_x and inside_z
 
+    def _height_policy(self, phone_pos: np.ndarray, attempt: int) -> Tuple[float, float]:
+        """
+        Avoid overly high lift. Always clamp below cabinet top.
+        """
+        margin = 0.08
+        inside_clear_z = min(self.cab_top_z - margin,
+                             phone_pos[2] + 0.17 + 0.01 * attempt)
+        transit_z = min(self.cab_top_z - margin,
+                        max(inside_clear_z, self.ws_top_z + 0.18))
+        return float(inside_clear_z), float(transit_z)
+
+    # -----------------------
+    # Planning (PICK/RETRACT/PLACE)
+    # -----------------------
     def plan_pick(self) -> List[List[float]]:
         phone_pos = np.array(p.getBasePositionAndOrientation(self.phone_id)[0], dtype=float)
 
         ee_quat = self.build_ee_quat_from_world_fwd_down(
-            fwd_w=np.array([0.0, 1.0, 0.0]),
-            down_w=np.array([0.0, 0.0, -1.0])
+            fwd_w=np.array([0.0, 1.0, 0.0]),   # into cabinet
+            down_w=np.array([0.0, 0.0, -1.0]),
+            ee_to_gripper_quat=self.ee_to_gripper_quat
         )
         cur_pos = self.ee_world_pos()
 
-        x_min = self.cab_center[0] - self.cab_inner_w / 2.0 + 0.08
-        x_max = self.cab_center[0] + self.cab_inner_w / 2.0 - 0.08
+        x_min = self.cab_center[0] - self.cab_inner_w / 2.0 + 0.07
+        x_max = self.cab_center[0] + self.cab_inner_w / 2.0 - 0.07
 
-        def builder(attempt: int):
-            detours = [0.0, +0.02, -0.02, +0.04, -0.04, +0.06, -0.06]
+        def builder(attempt: int) -> List[Waypoint]:
+            # structured detours: shift x slightly to avoid side collisions
+            detours = [0.0, +0.025, -0.025, +0.05, -0.05, +0.075, -0.075]
             dx = detours[min(attempt, len(detours) - 1)]
             x = float(clamp(phone_pos[0] + dx, x_min, x_max))
 
-            y_edge = float(self.cab_front_y - (0.20 + 0.01 * attempt))
+            # y at cabinet opening (outside), then inside at phone y
+            y_edge = float(self.cab_front_y - (0.20 + 0.02 * attempt))
             y_in = float(phone_pos[1])
 
-            z_inside, _ = self._height_policy_low(phone_pos, attempt)
-            z_down = float(phone_pos[2] + 0.001)
+            inside_clear_z, _ = self._height_policy(phone_pos, attempt)
+            z_down = float(phone_pos[2])
 
+            # clear first (from current), then go to opening, then move inside, then down
             return [
                 Waypoint("start", cur_pos, ee_quat),
-                Waypoint("edge", np.array([x, y_edge, z_inside]), ee_quat),
-                Waypoint("in",   np.array([x, y_in,   z_inside]), ee_quat),
-                Waypoint("down", np.array([x, y_in,   z_down]), ee_quat),
+                Waypoint("to_clear", np.array([cur_pos[0], cur_pos[1], inside_clear_z]), ee_quat),
+                Waypoint("edge_clear", np.array([x, y_edge, inside_clear_z]), ee_quat),
+                Waypoint("in_clear", np.array([x, y_in, inside_clear_z]), ee_quat),
+                Waypoint("down_pick", np.array([x, y_in, z_down]), ee_quat),
             ]
 
-        return self.plan_cartesian_avoid_shortest("PICK", builder)
+        return self.plan_cartesian_avoid("PICK", builder)
 
     def plan_retract(self) -> List[List[float]]:
         phone_pos = np.array(p.getBasePositionAndOrientation(self.phone_id)[0], dtype=float)
+
         ee_quat = self.build_ee_quat_from_world_fwd_down(
             fwd_w=np.array([0.0, 1.0, 0.0]),
-            down_w=np.array([0.0, 0.0, -1.0])
+            down_w=np.array([0.0, 0.0, -1.0]),
+            ee_to_gripper_quat=self.ee_to_gripper_quat
         )
         cur_pos = self.ee_world_pos()
 
-        x_min = self.cab_center[0] - self.cab_inner_w / 2.0 + 0.08
-        x_max = self.cab_center[0] + self.cab_inner_w / 2.0 - 0.08
+        x_min = self.cab_center[0] - self.cab_inner_w / 2.0 + 0.07
+        x_max = self.cab_center[0] + self.cab_inner_w / 2.0 - 0.07
         x = float(clamp(phone_pos[0], x_min, x_max))
 
-        def builder(attempt: int):
+        def builder(attempt: int) -> List[Waypoint]:
+            y_edge = float(self.cab_front_y - (0.22 + 0.02 * attempt))
             y_in = float(phone_pos[1])
-            y_edge = float(self.cab_front_y - (0.22 + 0.01 * attempt))
-            y_far = float(self.cab_front_y - (0.36 + 0.01 * attempt))
-            z_inside, z_out = self._height_policy_low(phone_pos, attempt)
+
+            inside_clear_z, transit_z = self._height_policy(phone_pos, attempt)
 
             return [
                 Waypoint("start", cur_pos, ee_quat),
-                Waypoint("lift", np.array([x, y_in,   z_inside]), ee_quat),
-                Waypoint("edge", np.array([x, y_edge, z_inside]), ee_quat),
-                Waypoint("far",  np.array([x, y_far,  z_out]),    ee_quat),
+                Waypoint("lift_clear", np.array([x, y_in, inside_clear_z]), ee_quat),
+                Waypoint("back_edge", np.array([x, y_edge, inside_clear_z]), ee_quat),
+                Waypoint("edge_transit", np.array([x, y_edge, transit_z]), ee_quat),
             ]
 
-        return self.plan_cartesian_avoid_shortest("RETRACT", builder)
+        return self.plan_cartesian_avoid("RETRACT", builder)
 
     def plan_place(self) -> List[List[float]]:
         ws = self.ws_target.copy()
         phone_pos = np.array(p.getBasePositionAndOrientation(self.phone_id)[0], dtype=float)
 
         ee_quat = self.build_ee_quat_from_world_fwd_down(
-            fwd_w=np.array([0.0, 1.0, 0.0]),
-            down_w=np.array([0.0, 0.0, -1.0])
+            fwd_w=np.array([0.0, -1.0, 0.0]),  # toward outside/operator
+            down_w=np.array([0.0, 0.0, -1.0]),
+            ee_to_gripper_quat=self.ee_to_gripper_quat
         )
         cur_pos = self.ee_world_pos()
 
-        def builder(attempt: int):
-            _, z_out = self._height_policy_low(phone_pos, attempt)
-            z_pre = float(z_out + 0.05 + 0.005 * attempt)
+        def builder(attempt: int) -> List[Waypoint]:
+            inside_clear_z, transit_z = self._height_policy(phone_pos, attempt)
+            y_exit = float(self.cab_front_y - (0.24 + 0.02 * attempt))
+
+            # do NOT lift too high: clamp below cabinet top, and only a bit above workstation
+            z_pre = float(min(self.cab_top_z - 0.08, self.ws_top_z + 0.20 + 0.01 * attempt))
             z_touch = float(self.ws_top_z + self.scene.phone_size[2] / 2.0 + 0.002)
 
-            return [
-                Waypoint("start", cur_pos, ee_quat),
-                Waypoint("ws_pre",   np.array([ws[0], ws[1], z_pre]),   ee_quat),
+            wps = [Waypoint("start", cur_pos, ee_quat)]
+
+            if self.is_inside_cabinet(cur_pos):
+                wps.append(Waypoint("exit_y", np.array([cur_pos[0], y_exit, inside_clear_z]), ee_quat))
+                wps.append(Waypoint("exit_transit", np.array([cur_pos[0], y_exit, transit_z]), ee_quat))
+            else:
+                wps.append(Waypoint("to_transit", np.array([cur_pos[0], cur_pos[1], transit_z]), ee_quat))
+
+            wps += [
+                Waypoint("ws_transit", np.array([ws[0], ws[1], transit_z]), ee_quat),
+                Waypoint("ws_pre", np.array([ws[0], ws[1], z_pre]), ee_quat),
                 Waypoint("ws_touch", np.array([ws[0], ws[1], z_touch]), ee_quat),
             ]
+            return wps
 
-        return self.plan_cartesian_avoid_shortest("PLACE", builder)
-
-    # -----------------------
-    # Snap to target (optional)
-    # -----------------------
-    def snap_phone_to_workstation_if_close(self):
-        if not self.scene.snap_place:
-            return
-        opos, _ = p.getBasePositionAndOrientation(self.phone_id)
-        opos = np.array(opos, dtype=float)
-        dxy = float(np.linalg.norm(opos[:2] - self.ws_target[:2]))
-        dz = float(abs(opos[2] - (self.ws_top_z + self.scene.phone_size[2] / 2.0)))
-        if dxy <= self.scene.snap_xy_tol and dz <= self.scene.snap_z_tol:
-            new_pos = np.array([self.ws_target[0], self.ws_target[1],
-                                self.ws_top_z + self.scene.phone_size[2] / 2.0], dtype=float)
-            p.resetBasePositionAndOrientation(self.phone_id, new_pos.tolist(), [0, 0, 0, 1])
-            self._zero_phone_velocity()
+        return self.plan_cartesian_avoid("PLACE", builder)
 
     # -----------------------
-    # Run flow
+    # Main flow (guarantee pick&place or raise clear error)
     # -----------------------
     def run(self):
-        print("\n[Flow] 1) Hold init (stable)...")
-        self.hold(0.9)
+        print("\n[Flow] 1) init hold (arm must not move)...")
+        self.hold(0.8)
 
-        print("\n[Flow] 2) Plan pick (shortest collision-free)...")
+        print("\n[Flow] 2) plan pick path (collision-checked)...")
         pick_traj = self.plan_pick()
-
-        print("[Flow] 3) Execute pick...")
+        print("[Flow] 3) execute pick...")
         self.set_gripper(0.0)
         self.hold(0.2)
         self.exec_q_traj("PICK", pick_traj)
 
-        print("[Flow] 4) Close gripper and attach...")
+        # close gripper & attach
+        print("[Flow] 4) close gripper & attach phone...")
         attached = False
         steps = int(1.0 / self.plan.dt)
         for i in range(steps):
             frac = (i + 1) / max(1, steps)
             self.set_gripper(frac)
-            self.lock_arm_targets(self.get_arm_q())
             p.stepSimulation()
             self._update_meshcat()
             if (not attached) and frac > 0.86:
@@ -1471,26 +1512,25 @@ class UR3PickPlaceDemo:
 
         print("[Pick] grasp_success =", attached)
         if not attached:
-            raise RuntimeError("Pick failed: phone too far / alignment off. (No attach)")
+            raise RuntimeError("Pick failed: gripper could not attach phone (pose too far or not closed).")
 
-        print("\n[Flow] 5) Retract (shortest collision-free)...")
+        print("\n[Flow] 5) retract out of cabinet (collision-checked)...")
         ret_traj = self.plan_retract()
         self.exec_q_traj("RETRACT", ret_traj)
-        self.hold(0.2)
+        self.hold(0.20)
 
-        print("\n[Flow] 6) Plan & execute place (shortest collision-free)...")
+        print("\n[Flow] 6) plan+execute place trajectory...")
         place_traj = self.plan_place()
         self.exec_q_traj("PLACE", place_traj)
 
-        print("\n[Flow] 7) Release...")
+        print("\n[Flow] 7) release phone on workstation...")
         self.detach_phone()
         self._zero_phone_velocity()
 
-        steps = int(0.9 / self.plan.dt)
+        # open gripper slowly
         for i in range(steps):
             frac = 1.0 - (i + 1) / max(1, steps)
             self.set_gripper(frac)
-            self.lock_arm_targets(self.get_arm_q())
             p.stepSimulation()
             self._update_meshcat()
             if self.plan.realtime:
@@ -1498,18 +1538,15 @@ class UR3PickPlaceDemo:
 
         self.set_gripper(0.0)
         self._zero_phone_velocity()
-        self.snap_phone_to_workstation_if_close()
+        self.snap_phone_to_ws_if_close()
 
-        print("\n[Flow] Done (phone placed). Ctrl+C to exit.")
+        print("\n[Flow] Done. Ctrl+C to exit.")
         while True:
-            self.lock_arm_targets(self.get_arm_q())
+            self.lock_arm_targets()
             p.stepSimulation()
             self._update_meshcat()
             time.sleep(1 / 60)
 
 
-# =========================
-# Entry
-# =========================
 if __name__ == "__main__":
     UR3PickPlaceDemo().run()
