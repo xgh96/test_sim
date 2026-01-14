@@ -1,0 +1,258 @@
+{
+  "mode": "run6dof_sequence",
+  "started_at": "2026-01-14T06:45:52.360359+00:00",
+  "steps": [
+    {
+      "tool": "run6dof_reset",
+      "result": {
+        "ok": true,
+        "message": "Reset done. Call stage 00 to initialize."
+      }
+    },
+    {
+      "tool": "run6dof_stage_00_init",
+      "result": {
+        "ok": true,
+        "stage": 0,
+        "stage_name": "init",
+        "next_stage": 1,
+        "phone_pos": [
+          0.21000295374353786,
+          0.35000118790367535,
+          0.32498954395392154
+        ],
+        "start_pos": [
+          -0.034877970814704895,
+          0.3132369816303253,
+          0.4041016101837158
+        ],
+        "xy_dist": 0.4081691709512054,
+        "message": "Init done; pick path planned."
+      }
+    },
+    {
+      "tool": "run6dof_stage_01_lift",
+      "result": {
+        "ok": true,
+        "stage": 1,
+        "stage_name": "lift_from_folded",
+        "next_stage": 2,
+        "lift_pos": [
+          -0.034877970814704895,
+          0.3132369816303253,
+          0.39999999999999997
+        ],
+        "message": "Stage 1 done: lift from folded pose."
+      }
+    },
+    {
+      "tool": "run6dof_stage_02_base_overhead",
+      "result": {
+        "ok": true,
+        "stage": 2,
+        "stage_name": "move_above_base",
+        "next_stage": 3,
+        "base_overhead": [
+          0.05,
+          0.3132369816303253,
+          0.39999999999999997
+        ],
+        "message": "Stage 2 done: move above base."
+      }
+    },
+    {
+      "tool": "run6dof_stage_03_align_y",
+      "result": {
+        "ok": true,
+        "stage": 3,
+        "stage_name": "align_y",
+        "next_stage": 4,
+        "y_aligned": [
+          0.05,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "message": "Stage 3 done: align Y with cabinet."
+      }
+    },
+    {
+      "tool": "run6dof_stage_04_to_cabinet_side",
+      "result": {
+        "ok": true,
+        "stage": 4,
+        "stage_name": "move_to_cabinet_side",
+        "next_stage": 5,
+        "side_high": [
+          0.030000000000000027,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "side_entry": [
+          0.030000000000000027,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "message": "Stage 4 done: move to cabinet side."
+      }
+    },
+    {
+      "tool": "run6dof_stage_05_enter_cabinet",
+      "result": {
+        "ok": true,
+        "stage": 5,
+        "stage_name": "enter_cabinet",
+        "next_stage": 6,
+        "inside_entry": [
+          0.18000000000000002,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "above_target": [
+          0.21000295374353786,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "message": "Stage 5 done: enter cabinet and move above target."
+      }
+    },
+    {
+      "tool": "run6dof_stage_06_align_gripper_yaw",
+      "result": {
+        "ok": true,
+        "stage": 6,
+        "stage_name": "align_gripper_yaw",
+        "next_stage": 7,
+        "above_target": [
+          0.21000295374353786,
+          0.35000118790367535,
+          0.39999999999999997
+        ],
+        "message": "Stage 6 done: align gripper yaw."
+      }
+    },
+    {
+      "tool": "run6dof_stage_07_descend_approach",
+      "result": {
+        "ok": true,
+        "stage": 7,
+        "stage_name": "descend_to_approach",
+        "next_stage": 8,
+        "approach": [
+          0.21000295374353786,
+          0.35000118790367535,
+          0.3863228772872549
+        ],
+        "message": "Stage 7 done: descend to approach height."
+      }
+    },
+    {
+      "tool": "run6dof_stage_08_grasp",
+      "result": {
+        "ok": true,
+        "stage": 8,
+        "stage_name": "grasp",
+        "next_stage": 9,
+        "grasp": [
+          0.21000295374353786,
+          0.35000118790367535,
+          0.33298954395392155
+        ],
+        "message": "Stage 8 done: grasp success."
+      }
+    },
+    {
+      "tool": "run6dof_stage_09_exit_cabinet",
+      "result": {
+        "ok": true,
+        "stage": 9,
+        "stage_name": "exit_cabinet",
+        "next_stage": 10,
+        "exit_side": [
+          0.030000000000000027,
+          0.35000118790367535,
+          0.5168995963300906
+        ],
+        "message": "Stage 9 done: exit cabinet."
+      }
+    },
+    {
+      "tool": "run6dof_stage_10_forward_pose",
+      "result": {
+        "ok": true,
+        "stage": 10,
+        "stage_name": "reorient_forward",
+        "next_stage": 11,
+        "forward_yaw": -0.6078019961139602,
+        "message": "Stage 10 done: reorient to forward pose."
+      }
+    },
+    {
+      "tool": "run6dof_stage_11_front_corridor",
+      "result": {
+        "ok": true,
+        "stage": 11,
+        "stage_name": "front_corridor",
+        "next_stage": 12,
+        "front_y_target": [
+          0.23000000000000004,
+          -0.15999999999999998,
+          0.5700000000000001
+        ],
+        "message": "Stage 11 done: move along front corridor."
+      }
+    },
+    {
+      "tool": "run6dof_stage_12_place_hover",
+      "result": {
+        "ok": true,
+        "stage": 12,
+        "stage_name": "move_to_place_hover",
+        "next_stage": 13,
+        "place_hover": [
+          0.23000000000000004,
+          -0.15999999999999998,
+          0.47
+        ],
+        "message": "Stage 12 done: move to place hover."
+      }
+    },
+    {
+      "tool": "run6dof_stage_13_align_place",
+      "result": {
+        "ok": true,
+        "stage": 13,
+        "stage_name": "align_for_place",
+        "next_stage": 14,
+        "message": "Stage 13 done: align vertical for place."
+      }
+    },
+    {
+      "tool": "run6dof_stage_14_place_release",
+      "result": {
+        "ok": true,
+        "stage": 14,
+        "stage_name": "place_and_release",
+        "next_stage": 15,
+        "placed": true,
+        "message": "Stage 14 done: place and release."
+      }
+    },
+    {
+      "tool": "run6dof_stage_15_return_home",
+      "result": {
+        "ok": true,
+        "stage": 15,
+        "stage_name": "return_home",
+        "next_stage": null,
+        "return_home": [
+          0.0,
+          0.0,
+          0.32
+        ],
+        "message": "Stage 15 done: return home.",
+        "completed": true
+      }
+    }
+  ],
+  "final": "任务完成"
+}
